@@ -2,8 +2,6 @@
 
 A development project for processing orders with Spring Boot services, Kafka, PostgreSQL, and React. It separates order intake, validation, payment, inventory, fulfillment, and monitoring into independently deployed services. Each business service owns its data, and Kafka carries events between workflow stages.
 
-> [!NOTE]
-> This repository is intended for local development and demonstration. It does not include authentication, production secret management, or a highly available Kafka setup.
 
 ## Table of contents
 
@@ -28,15 +26,15 @@ A development project for processing orders with Spring Boot services, Kafka, Po
 
 The system separates the order lifecycle into independently deployable services. Each business service owns its PostgreSQL database and communicates with other services through Kafka events. The frontend provides operational views for orders, validation, payment, inventory, fulfillment, retries, failed events, replay, idempotency, audit history, and monitoring.
 
-The principal domain sequence is:
+The implemented domain sequence is:
 
 1. Accept and persist an order.
 2. Publish an order-created event.
 3. Validate the order asynchronously.
-4. Process payment for a valid order.
-5. Reserve inventory after payment completion.
-6. Create fulfillment after inventory reservation.
-7. Publish order completion.
+4. Create a `PENDING` payment record for a valid order. The automatic flow currently stops here because the payment service does not publish `payment-completed-events`.
+5. When a product-aware `payment-completed-events` event is supplied through replay or an external/manual producer, verify and reserve inventory.
+6. Create and immediately complete fulfillment after an inventory reservation.
+7. Publish `order-completed`.
 
 Supporting workflows record duplicate-event decisions, retry attempts, exhausted events, replay requests, audit entries, health information, and performance metrics.
 
@@ -119,7 +117,7 @@ flowchart LR
 
 - REST API for order creation, retrieval, filtering, sorting, and pagination.
 - Asynchronous order validation and validation-result events.
-- Payment, inventory, and fulfillment persistence workflows.
+- Payment persistence plus inventory and fulfillment workflows that can continue from a product-aware `payment-completed-events` event.
 - Inventory availability checks and pessimistic locking during reservation.
 - Per-service idempotency records for event processing.
 - Configurable retry records with scheduled retry attempts and exhaustion handling.
@@ -167,7 +165,7 @@ distributed-order-processing-system/
 | Validation Service | `8081` | `validationdb` | Consumes new orders, validates business rules, and publishes validation outcomes. |
 | Payment Service | `8082` | `paymentdb` | Consumes validated orders and persists payment records. |
 | Inventory Service | `8083` | `inventorydb` | Manages stock, consumes payment-completed events, and publishes reservation outcomes. |
-| Fulfillment Service | `8084` | `fulfillmentdb` | Consumes inventory reservations, creates fulfillment records, stores history, and publishes completion. |
+| Fulfillment Service | `8084` | `fulfillmentdb` | Consumes inventory reservations, derives a placeholder customer ID from the order ID, creates fulfillment records, stores history, and publishes completion. |
 | Monitoring Service | `8086` | `monitoringdb` | Aggregates service health and calculates event throughput, latency, and failure metrics. |
 | Frontend | `3000` | — | React operations dashboard served by Nginx in Docker. |
 | Kafka | `9092` | — | Host-accessible event broker; containers use `kafka:29092`. |
@@ -184,7 +182,7 @@ The validation, payment, inventory, and fulfillment services also expose retry, 
 | `order-validation-failed` | Validation Service | Audit, Monitoring | Records an invalid order outcome. |
 | `payment-completed-events` | Replay API or an external/manual producer | Inventory Service, Audit, Monitoring | Starts inventory verification and reservation; the current payment service does not publish this topic. |
 | `inventory-reserved` | Inventory Service | Fulfillment Service, Audit, Monitoring | Starts fulfillment for reserved stock. |
-| `inventory-rejected` | Inventory Service | Audit, Monitoring | Reports inventory rejection or insufficient stock. |
+| `inventory-rejected` | Inventory Service | Audit, Monitoring | Reports a rejected reservation attempt. The consumer's initial insufficient-stock check currently logs and acknowledges without publishing this event. |
 | `order-completed` | Fulfillment Service | Audit, Monitoring | Signals completion of fulfillment. |
 | `retry-orders` | Recovery services | Service-specific retry consumer groups | Carries retry envelopes for failed processing. |
 | `dead-letter-orders` | Recovery services | Service-specific DLQ consumer groups | Stores events whose retry budget is exhausted. |
@@ -192,7 +190,7 @@ The validation, payment, inventory, and fulfillment services also expose retry, 
 Kafka uses JSON values and string keys. Business services use distinct consumer groups, while audit and monitoring use their own groups so they can observe the complete event stream independently.
 
 > [!IMPORTANT]
-> Orders currently contain a customer ID and total amount, but no product line items. Because the inventory event needs product data, the payment service cannot create `payment-completed-events` from the current order contract. The inventory consumer, recovery flow, audit handling, and monitoring handling for that topic are already present.
+> Orders currently contain a customer ID and total amount, but no product line items. Because the inventory event needs product data, the payment service cannot create `payment-completed-events` from the current order contract. The inventory consumer, recovery flow, audit handling, and monitoring handling for that topic are already present. `InventoryReservedEvent` also does not carry the original customer ID, so fulfillment currently derives a placeholder value from the order ID.
 
 ## API overview
 
@@ -308,6 +306,7 @@ sequenceDiagram
     participant Kafka
     participant Validation as Validation Service
     participant Payment as Payment Service
+    participant Source as External or Replay Source
     participant Inventory as Inventory Service
     participant Fulfillment as Fulfillment Service
 
@@ -320,8 +319,9 @@ sequenceDiagram
     alt Order is valid
         Validation->>Kafka: order-validated
         Kafka->>Payment: OrderValidatedEvent
-        Payment->>Payment: Persist payment
-        Note over Payment,Kafka: Product-aware payment completion<br/>requires line-item data upstream
+        Payment->>Payment: Persist PENDING payment
+        Note over Payment,Kafka: Automatic workflow stops here:<br/>Payment publishes no completion event
+        Source->>Kafka: payment-completed-events<br/>(product-aware event)
         Kafka->>Inventory: payment-completed-events
         Inventory->>Inventory: Verify and reserve stock
         alt Stock is available
@@ -330,7 +330,7 @@ sequenceDiagram
             Fulfillment->>Fulfillment: Create fulfillment and history
             Fulfillment->>Kafka: order-completed
         else Stock is unavailable
-            Inventory->>Kafka: inventory-rejected
+            Note over Inventory,Kafka: Initial availability failure is logged<br/>and acknowledged without an event
         end
     else Order is invalid
         Validation->>Kafka: order-validation-failed
